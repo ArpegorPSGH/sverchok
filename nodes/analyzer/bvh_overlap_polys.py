@@ -17,64 +17,93 @@
 # ##### END GPL LICENSE BLOCK #####
 
 import bpy
-import numpy as np
-from mathutils.bvhtree import BVHTree
-from bpy.props import FloatProperty, BoolProperty
 from sverchok.node_tree import SverchCustomTreeNode
-from sverchok.data_structure import (updateNode)
+from sverchok.data_structure import (updateNode, match_long_cycle as C)
+from sverchok.utils.bvh_tree import bvh_tree_from_polygons
 
+# zeffii 2017 8 okt
+# airlifted from Kosvor's Raycast nodes..
 
-class SvBvhOverlapNodeNew(SverchCustomTreeNode, bpy.types.Node):
-    ''' BVH Tree Overlap New '''
-    bl_idname = 'SvBvhOverlapNodeNew'
-    bl_label = 'Overlap Polygons'
+class SvRaycasterLiteNode(SverchCustomTreeNode, bpy.types.Node):
+    """
+    Triggers: Raycast on Mesh
+    Tooltip: Cast rays from arbitrary points on to a mesh a determine hiting location, normal at hitpoint, ray legngth and index of the hitted face.
+    """
+    bl_idname = 'SvRaycasterLiteNode'
+    bl_label = 'Raycaster'
     bl_icon = 'OUTLINER_OB_EMPTY'
-    sv_icon = 'SV_OVERLAP_POLYGONS'
+    sv_icon = 'SV_RAYCASTER'
 
-    triangles: BoolProperty(name="all triangles",
-                             description="Boolean to work with triangles makes it faster to calculate", default=False,
-                             update=updateNode)
-
-    epsilon: FloatProperty(name="epsilon",
-                            description="Float threshold for cut weak results", default=0.0, min=0.0, max=10.0,
-                            update=updateNode)
+    start: bpy.props.FloatVectorProperty(default=(0,0,0), size=3, update=updateNode)
+    direction: bpy.props.FloatVectorProperty(default=(0,0,-1), size=3, update=updateNode)
+    all_triangles: bpy.props.BoolProperty(
+        name='All Triangles',
+        description='Enable to improve node performance if all inputted polygons are triangles',
+        default=False,
+        update=updateNode)
+    safe_check: bpy.props.BoolProperty(
+        name='Safe Check',
+        description='When disabled polygon indices referring to unexisting points will crash Blender but makes node faster',
+        default=True)
+    epsilon: bpy.props.FloatProperty(
+        name="epsilon",
+        description="Float threshold for cut weak results",
+        default=0.0,
+        min=0.0,
+        max=10.0,
+        update=updateNode)
 
     def draw_buttons_ext(self, context, layout):
-        layout.prop(self, "triangles")
+        layout.prop(self, 'all_triangles')
+        layout.prop(self, 'safe_check')
         layout.prop(self, "epsilon")
-
     def sv_init(self, context):
-        self.inputs.new('SvVerticesSocket', 'Vert(A)')
-        self.inputs.new('SvStringsSocket', 'Poly(A)')
-        self.inputs.new('SvVerticesSocket', 'Vert(B)')
-        self.inputs.new('SvStringsSocket', 'Poly(B)')
-        self.outputs.new('SvStringsSocket', 'PolyIndex(A)')
-        self.outputs.new('SvStringsSocket', 'PolyIndex(B)')
-        self.outputs.new('SvStringsSocket', 'OverlapPoly(A)')
-        self.outputs.new('SvStringsSocket', 'OverlapPoly(B)')
+        si = self.inputs.new
+        so = self.outputs.new
+
+        si('SvVerticesSocket', 'Verts')
+        si('SvStringsSocket', 'Faces')
+        si('SvVerticesSocket', 'Start').prop_name = 'start'
+        si('SvVerticesSocket', 'Direction').prop_name = 'direction'
+
+        so('SvVerticesSocket', 'Location')
+        so('SvVerticesSocket', 'Normal')
+        so('SvStringsSocket', 'Index')
+        so('SvStringsSocket', 'Distance')
+        so('SvStringsSocket', 'Success')
+
+    @staticmethod
+    def svmesh_to_bvh_lists(v, f, all_tris, epsilon, safe_check):
+        for vertices, polygons in zip(*C([v, f])):
+            yield bvh_tree_from_polygons(vertices, polygons, all_triangles=all_tris, epsilon=epsilon, safe_check=safe_check)
 
     def process(self):
-        btr = BVHTree.FromPolygons
-        V1, P1, V2, P2 = [i.sv_get()[0] for i in self.inputs]
-        outIndA, outIndB, Pover1, Pover2 = self.outputs
-        Tri, epsi = self.triangles, self.epsilon
-        T1 = btr(V1, P1, all_triangles = Tri, epsilon = epsi)
-        T2 = btr(V2, P2, all_triangles = Tri, epsilon = epsi)
-        ind1 = np.unique([i[0] for i in T1.overlap(T2)]).tolist()
-        ind2 = np.unique([i[0] for i in T2.overlap(T1)]).tolist()
-        if outIndA.is_linked:
-            outIndA.sv_set([ind1])
-        if outIndB.is_linked:
-            outIndB.sv_set([ind2])
-        if Pover1.is_linked:
-            Pover1.sv_set([[P1[i] for i in ind1]])
-        if Pover2.is_linked:
-            Pover2.sv_set([[P2[i] for i in ind2]])
+        L, N, I, D, S = self.outputs
+        RL = []
+        if not any([s.is_linked for s in self.outputs]):
+            return
+        vert_in, face_in, start_in, direction_in = C([sock.sv_get(deepcopy=False) for sock in self.inputs])
+
+        for bvh, st, di in zip(*[self.svmesh_to_bvh_lists(vert_in, face_in, self.all_triangles, self.epsilon, self.safe_check), start_in, direction_in]):
+            st, di = C([st, di])
+            RL.append([bvh.ray_cast(i, i2) for i, i2 in zip(st, di)])
+
+        if L.is_linked:
+            L.sv_set([[r[0][:] if (r[0] is not None) else (0, 0, 0) for r in L] for L in RL])
+        if N.is_linked:
+            N.sv_set([[r[1][:] if (r[1] is not None) else (0, 0, 0) for r in L] for L in RL])
+        if I.is_linked:
+            I.sv_set([[r[2] if (r[2] is not None) else -1 for r in L] for L in RL])
+        if D.is_linked:
+            D.sv_set([[r[3] if (r[3] is not None) else 0 for r in L] for L in RL])
+        if S.is_linked:
+            S.sv_set([[(r[2] is not None) for r in L] for L in RL])
+
 
 
 def register():
-    bpy.utils.register_class(SvBvhOverlapNodeNew)
+    bpy.utils.register_class(SvRaycasterLiteNode)
 
 
 def unregister():
-    bpy.utils.unregister_class(SvBvhOverlapNodeNew)
+    bpy.utils.unregister_class(SvRaycasterLiteNode)
